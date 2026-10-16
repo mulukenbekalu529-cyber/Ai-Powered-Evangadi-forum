@@ -1,0 +1,100 @@
+import React from "react";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { AuthProvider } from "./contexts/AuthContext";
+import Layout from "./components/Layout/Layout";
+import ProtectedRoute from "./components/ProtectedRoute/ProtectedRoute";
+import Auth from "./pages/Auth/Auth";
+import Dashboard from "./pages/Dashboard/Dashboard";
+import MyQuestions from "./pages/MyQuestions/MyQuestions";
+import Landing from "./pages/Landing/Landing";
+import AskQuestion from "./pages/PostQuestion/PostQuestion";
+// import RagAnswerBody from './components/RagAnswerBody/RagAnswerBody';
+import QuestionDetail from "./pages/QuestionDetail/QuestionDetail";
+import ProfileUpdate from './pages/profileUpdatePage/ProfileUpdate'
+import AccountProfile from './pages/profileUpdatePage/AccountProfile'
+import KnowledgeBase from "./pages/KnowledgeBase/KnowledgeBase";
+function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          {/* Public routes */}
+          <Route path="/" element={<Landing />} />
+          <Route path="/auth" element={<Auth />} />
+
+          {/* Protected routes with Layout */}
+          <Route element={<Layout />}>
+            <Route
+              path="/dashboard"
+              element={
+                <ProtectedRoute>
+                  <Dashboard />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/questions/ask"
+              element={
+                <ProtectedRoute>
+                  <AskQuestion />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/my-questions"
+              element={
+                <ProtectedRoute>
+                  <MyQuestions />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/question/:questionHash"
+              element={
+                <ProtectedRoute>
+                  <QuestionDetail />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/profile"
+              element={
+                <ProtectedRoute>
+                  <AccountProfile />
+                </ProtectedRoute>
+              }
+            />
+
+            <Route
+              path="/profile/update"
+              element={
+                <ProtectedRoute>
+                  <ProfileUpdate />
+                </ProtectedRoute>
+              }
+            />
+
+
+
+            <Route
+              path="/rag-documents"
+              element={
+                <ProtectedRoute>
+                  <KnowledgeBase />
+                </ProtectedRoute>
+              }
+            />
+          </Route>
+
+          {/* Catch-all redirect */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
+  );
+}
+
+export default App;
