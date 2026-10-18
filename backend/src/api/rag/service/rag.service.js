@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import { randomInt } from "node:crypto";
+
 import {
   readPdfFile,
   extractPdfPages,
@@ -10,6 +12,56 @@ import { createChunks } from "./chunk.service.js";
 import { createEmbedding } from "./embedding.service.js";
 import { safeExecute } from "../../../../db/config.js";
 import { generateGroundedAnswer } from "./ai.service.js";
+
+// ==========================================
+// Generate IDs compatible with the DB columns
+// ==========================================
+
+// document_id is INT; chunk IDs are BIGINT.
+// Retry when a primary-key collision occurs.
+const generateDocumentId = () => randomInt(1, 2_147_483_647);
+
+// Stay within JavaScript's safe integer range for BIGINT IDs.
+const generateBigIntId = () =>
+  randomInt(1, 2_147_483_647) * 1_000_000 + randomInt(0, 1_000_000);
+
+const isDuplicateKeyError = (error) =>
+  error?.code === "ER_DUP_ENTRY" ||
+  error?.errno === 1062 ||
+  error?.code === "1062";
+
+const insertWithGeneratedId = async ({
+  table,
+  idColumn,
+  generateId,
+  columns,
+  values,
+}) => {
+  // Table and column names below are fixed by this service,
+  // never supplied by a user.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const id = generateId();
+    const placeholders = Array(values.length + 1)
+      .fill("?")
+      .join(", ");
+    const insertColumns = [idColumn, ...columns].join(", ");
+
+    try {
+      await safeExecute(
+        `INSERT INTO ${table} (${insertColumns}) VALUES (${placeholders})`,
+        [id, ...values],
+      );
+
+      return id;
+    } catch (error) {
+      if (!isDuplicateKeyError(error) || attempt === 4) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error(`Could not generate a unique ID for ${table}.`);
+};
 
 // ==========================================
 // Process Document (Supports PDF & TXT)
@@ -24,16 +76,13 @@ export const processDocument = async ({ userId, file }) => {
 
     console.log(`Starting RAG processing for: ${filename}`);
 
-    const docResult = await safeExecute(
-      `
-        INSERT INTO documents
-        (user_id, filename, file_path, status)
-        VALUES (?, ?, ?, ?)
-      `,
-      [userId, filename, filePath, "processing"],
-    );
-
-    documentId = docResult.insertId;
+    documentId = await insertWithGeneratedId({
+      table: "documents",
+      idColumn: "document_id",
+      generateId: generateDocumentId,
+      columns: ["user_id", "filename", "file_path", "status"],
+      values: [userId, filename, filePath, "processing"],
+    });
 
     // ==========================================
     // Check File Type (PDF vs TXT)
@@ -69,7 +118,7 @@ export const processDocument = async ({ userId, file }) => {
     console.log(`Extracted ${pages.length} pages/sections.`);
 
     // ==========================================
-    // Create chunks with Fallback Protection
+    // Create chunks with fallback protection
     // ==========================================
 
     let chunks = createChunks(pages);
@@ -96,7 +145,7 @@ export const processDocument = async ({ userId, file }) => {
     console.log(`Created ${chunks.length} text chunks.`);
 
     // ==========================================
-    // Create Embeddings and Save Chunks
+    // Create embeddings and save chunks
     // ==========================================
 
     for (let i = 0; i < chunks.length; i++) {
@@ -110,59 +159,51 @@ export const processDocument = async ({ userId, file }) => {
       }
 
       // ==========================================
-      // Save Chunk
+      // Save chunk with explicit chunk_id
       // ==========================================
 
-      const chunkResult = await safeExecute(
-        `
-          INSERT INTO document_chunks
-          (
-            document_id,
-            content,
-            chunk_index,
-            page_start,
-            page_end
-          )
-          VALUES (?, ?, ?, ?, ?)
-        `,
-        [
+      const chunkId = await insertWithGeneratedId({
+        table: "document_chunks",
+        idColumn: "chunk_id",
+        generateId: generateBigIntId,
+        columns: [
+          "document_id",
+          "content",
+          "chunk_index",
+          "page_start",
+          "page_end",
+        ],
+        values: [
           documentId,
           chunkContent,
           chunk.chunkIndex,
           chunk.pageStart,
           chunk.pageEnd,
         ],
-      );
-
-      const chunkId = chunkResult.insertId;
+      });
 
       // ==========================================
-      // Create Embedding
+      // Create embedding
       // ==========================================
 
       const embedding = await createEmbedding(chunkContent);
       const embeddingVectorJson = JSON.stringify(embedding);
 
       // ==========================================
-      // Save Embedding
+      // Save embedding with explicit chunk_vector_id
       // ==========================================
 
-      await safeExecute(
-        `
-          INSERT INTO document_chunk_vectors
-          (
-            chunk_id,
-            embedding_vector,
-            status
-          )
-          VALUES (?, ?, ?)
-        `,
-        [chunkId, embeddingVectorJson, "ready"],
-      );
+      await insertWithGeneratedId({
+        table: "document_chunk_vectors",
+        idColumn: "chunk_vector_id",
+        generateId: generateBigIntId,
+        columns: ["chunk_id", "embedding_vector", "status"],
+        values: [chunkId, embeddingVectorJson, "ready"],
+      });
     }
 
     // ==========================================
-    // Mark Document Ready
+    // Mark document ready
     // ==========================================
 
     await safeExecute(
@@ -184,7 +225,7 @@ export const processDocument = async ({ userId, file }) => {
   } catch (err) {
     console.error("Document Processing Error:", err);
 
-    if (documentId) {
+    if (documentId !== null) {
       await safeExecute(
         `
           UPDATE documents
@@ -196,7 +237,9 @@ export const processDocument = async ({ userId, file }) => {
     }
 
     if (file?.path) {
-      await deletePdfFile(file.path);
+      await deletePdfFile(file.path).catch((deleteError) => {
+        console.error("Error deleting uploaded file:", deleteError);
+      });
     }
 
     throw err;
@@ -240,10 +283,7 @@ export const listDocumentsForUserService = async ({ userId }) => {
 export const deleteDocumentService = async ({ documentId, userId }) => {
   const rows = await safeExecute(
     `
-      SELECT
-        document_id,
-        user_id,
-        file_path
+      SELECT document_id, user_id, file_path
       FROM documents
       WHERE document_id = ?
         AND user_id = ?
@@ -268,6 +308,23 @@ export const deleteDocumentService = async ({ documentId, userId }) => {
     console.error("Error deleting file physically:", error);
   }
 
+  // Remove dependent rows first because these tables may not have
+  // cascading foreign keys configured.
+  const chunkRows = await safeExecute(
+    "SELECT chunk_id FROM document_chunks WHERE document_id = ?",
+    [documentId],
+  );
+
+  for (const chunk of chunkRows) {
+    await safeExecute("DELETE FROM document_chunk_vectors WHERE chunk_id = ?", [
+      chunk.chunk_id,
+    ]);
+  }
+
+  await safeExecute("DELETE FROM document_chunks WHERE document_id = ?", [
+    documentId,
+  ]);
+
   await safeExecute(
     `
       DELETE FROM documents
@@ -277,9 +334,7 @@ export const deleteDocumentService = async ({ documentId, userId }) => {
     [documentId, userId],
   );
 
-  return {
-    id: documentId,
-  };
+  return { id: documentId };
 };
 
 // ==========================================
@@ -294,9 +349,11 @@ const normalizeSearchText = (text) =>
 
 export const vectorMagnitude = (vector) => {
   let sum = 0;
+
   for (const value of vector) {
     sum += value * value;
   }
+
   return Math.sqrt(sum);
 };
 
@@ -330,6 +387,7 @@ export const cosineSimilarity = (vectorA, vectorB) => {
 // ==========================================
 // Rank Chunks
 // ==========================================
+
 export const rankChunks = (chunks, queryEmbedding) => {
   return chunks
     .map((chunk) => {
@@ -341,17 +399,11 @@ export const rankChunks = (chunks, queryEmbedding) => {
             ? JSON.parse(chunk.embedding_vector)
             : chunk.embedding_vector;
       } catch (err) {
-        console.error(
-          `Invalid embedding for chunk ${chunk.chunk_id}`,
-          err,
-        );
+        console.error(`Invalid embedding for chunk ${chunk.chunk_id}`, err);
         return null;
       }
 
-      const rawSimilarity = cosineSimilarity(
-        queryEmbedding,
-        storedVector,
-      );
+      const rawSimilarity = cosineSimilarity(queryEmbedding, storedVector);
 
       const score = Number(rawSimilarity.toFixed(3));
 
@@ -369,6 +421,7 @@ export const rankChunks = (chunks, queryEmbedding) => {
     .filter(Boolean)
     .sort((a, b) => b.similarity - a.similarity);
 };
+
 // ==========================================
 // Get Ready Document
 // ==========================================
@@ -376,11 +429,7 @@ export const rankChunks = (chunks, queryEmbedding) => {
 const getReadyDocument = async ({ documentId, userId }) => {
   const documents = await safeExecute(
     `
-      SELECT
-        document_id,
-        filename AS title,
-        file_path,
-        status
+      SELECT document_id, filename AS title, file_path, status
       FROM documents
       WHERE document_id = ?
         AND user_id = ?
@@ -406,21 +455,12 @@ const getReadyDocument = async ({ documentId, userId }) => {
 };
 
 // ==========================================
-// Semantic Search
+// Get chunks for a document
 // ==========================================
 
-export const searchDocument = async ({ userId, documentId, query }) => {
-  let chunks = [];
-  let document = null;
-
-  if (documentId) {
-    document = await getReadyDocument({
-      documentId,
-      userId,
-    });
-
-    chunks = await safeExecute(
-      `
+const getDocumentChunks = async (documentId) => {
+  return safeExecute(
+    `
       SELECT
         dc.chunk_id,
         dc.document_id,
@@ -436,33 +476,46 @@ export const searchDocument = async ({ userId, documentId, query }) => {
         AND dcv.status = 'ready'
       ORDER BY dc.chunk_index ASC
     `,
-      [documentId],
-    );
+    [documentId],
+  );
+};
+
+// ==========================================
+// Semantic Search
+// ==========================================
+
+export const searchDocument = async ({ userId, documentId, query }) => {
+  let chunks = [];
+  let document = null;
+
+  if (documentId) {
+    document = await getReadyDocument({ documentId, userId });
+    chunks = await getDocumentChunks(documentId);
   } else {
     chunks = await safeExecute(
       `
-      SELECT
-        dc.chunk_id,
-        dc.document_id,
-        dc.content,
-        dc.chunk_index,
-        dc.page_start,
-        dc.page_end,
-        dcv.embedding_vector
-      FROM document_chunks AS dc
-      INNER JOIN document_chunk_vectors AS dcv
-        ON dc.chunk_id = dcv.chunk_id
-      INNER JOIN documents AS d
-        ON dc.document_id = d.document_id
-      WHERE d.user_id = ?
-        AND d.status = 'ready'
-      ORDER BY dc.chunk_index ASC
-    `,
+        SELECT
+          dc.chunk_id,
+          dc.document_id,
+          dc.content,
+          dc.chunk_index,
+          dc.page_start,
+          dc.page_end,
+          dcv.embedding_vector
+        FROM document_chunks AS dc
+        INNER JOIN document_chunk_vectors AS dcv
+          ON dc.chunk_id = dcv.chunk_id
+        INNER JOIN documents AS d
+          ON dc.document_id = d.document_id
+        WHERE d.user_id = ?
+          AND d.status = 'ready'
+        ORDER BY dc.chunk_index ASC
+      `,
       [userId],
     );
   }
-  console.log("Creating query embedding...");
 
+  console.log("Creating query embedding...");
   const queryEmbedding = await createEmbedding(query);
 
   if (!chunks || chunks.length === 0) {
@@ -480,6 +533,7 @@ export const searchDocument = async ({ userId, documentId, query }) => {
   const results = rankedChunks
     .filter((chunk) => chunk.similarity >= SIMILARITY_THRESHOLD)
     .slice(0, TOP_K);
+
   return {
     documentId: documentId || null,
     filename: document ? document.title : "All Documents",
@@ -499,14 +553,9 @@ export const askDocument = async ({ userId, documentId, question }) => {
   let document = null;
 
   if (documentId) {
-    document = await getReadyDocument({
-      documentId,
-      userId,
-    });
-
+    document = await getReadyDocument({ documentId, userId });
     chunks = await getDocumentChunks(documentId);
   } else {
-    // Cross-Search (All Documents Mode)
     chunks = await safeExecute(
       `
         SELECT
@@ -516,8 +565,7 @@ export const askDocument = async ({ userId, documentId, question }) => {
           dc.chunk_index,
           dc.page_start,
           dc.page_end,
-          dcv.embedding_vector AS embedding,
-          dcv.embedding_vector AS embedding_vector
+          dcv.embedding_vector
         FROM document_chunks AS dc
         INNER JOIN document_chunk_vectors AS dcv
           ON dc.chunk_id = dcv.chunk_id
@@ -531,7 +579,6 @@ export const askDocument = async ({ userId, documentId, question }) => {
   }
 
   console.log("Creating question embedding...");
-
   const questionEmbedding = await createEmbedding(question);
 
   if (!chunks || chunks.length === 0) {
@@ -564,7 +611,7 @@ export const askDocument = async ({ userId, documentId, question }) => {
     .join("\n\n");
 
   const answer = await generateGroundedAnswer({
-    documentName: document ? document.filename : "All Library Documents",
+    documentName: document ? document.title : "All Library Documents",
     context,
     question,
   });
@@ -591,10 +638,7 @@ export const askDocument = async ({ userId, documentId, question }) => {
 export const getDocumentFile = async ({ documentId, userId }) => {
   const rows = await safeExecute(
     `
-      SELECT
-        document_id,
-        filename,
-        file_path
+      SELECT document_id, filename, file_path
       FROM documents
       WHERE document_id = ?
         AND user_id = ?
