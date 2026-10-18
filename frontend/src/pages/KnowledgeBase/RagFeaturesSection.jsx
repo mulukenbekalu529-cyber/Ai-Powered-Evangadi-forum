@@ -103,7 +103,7 @@ export default function RagFeaturesSection({
                 )
               ) : (
                 <iframe
-                  src={`http://localhost:5000/api/rag/documents/${selectedDoc.documentId}/file?token=${encodeURIComponent(
+                  src={`${import.meta.env.VITE_API_BASE_URL || "https://ai-powered-evangadi-backend-5lar.onrender.com"}/api/rag/documents/${selectedDoc.documentId}/file?token=${encodeURIComponent(
                     token,
                   )}`}
                   title={selectedDoc.title}
