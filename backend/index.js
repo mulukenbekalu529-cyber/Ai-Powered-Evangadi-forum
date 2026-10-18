@@ -15,7 +15,12 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-
+// Root route
+app.get("/", (req, res) => {
+  res.status(200).json({
+    message: "Evangadi backend is running!",
+  });
+});
 // Health check
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });
