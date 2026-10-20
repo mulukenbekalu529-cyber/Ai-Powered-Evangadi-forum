@@ -5,9 +5,9 @@ An AI-powered Q&A forum where users register, log in, post questions, and share 
 
 **Live Links**
 
-App (vercel): https://ai-powered-evangadi-forum-gilt.vercel.app/
+## App (vercel): https://ai-powered-evangadi-forum-gilt.vercel.app/
 
-Backend API (Render): https://ai-powered-evangadi-backend-5lar.onrender.com
+## Backend API (Render): https://ai-powered-evangadi-backend-5lar.onrender.com
 
 **Features**
 
